@@ -1,68 +1,92 @@
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, filters, CallbackContext
+import os
+import requests
+from pydub import AudioSegment
+import speech_recognition as sr
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 import tel_bot.constants as const
-from telegram.ext import ApplicationBuilder
+from haystack.components.generators.chat import HuggingFaceTGIChatGenerator
+from haystack.dataclasses import ChatMessage
+
+# Last 10 chat conversations
+msg = []
+
+# Set Hugging Face API token
+hf_token = const.hf_token
+# Initialize Hugging Face Chat Generator
+generator = HuggingFaceTGIChatGenerator(
+    model="mistralai/Mistral-7B-Instruct-v0.2",
+    generation_kwargs={"max_new_tokens": 350},
+)
+
+generator.warm_up()
+
+# Initialize Telegram Bot
+TOKEN = const.token
+app = Application.builder().token(TOKEN).build()
 
 
-async def start_command(update: Update, context: CallbackContext):
-    await update.message.reply_text("this is a LLMbot")
+
+# Start command
+async def start(update: Update, context):
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="Welcome to my bot What do you need help with?")
 
 
-async def help_command(update: Update, context: CallbackContext):
-    await update.message.reply_text("i cannot help now")
+# Help command
+async def help(update: Update, context):
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="what are you waiting for ask something \nYou can also send voice messages here")
 
 
-async def custom_command(update: Update, context: CallbackContext):
-    await update.message.reply_text("this is a custom command")
+# Handle text messages
+async def handle_text(update: Update, context):
+    msg.append(ChatMessage.from_user(update.message.text))
+    response = generator.run(messages=msg)
+    msg.append(response["replies"][0])
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=response["replies"][0].content)
+    if len(msg) > 20:
+        msg.pop(0)
+        msg.pop(0)
 
 
-# responses
+# Handle voice messages
+async def handle_voice(update: Update, context):
+    # Download voice message
+    voice_file = context.bot.get_file(update.message.voice.file_id)
+    file = requests.get("https://api.telegram.org/file/bot{0}/{1}".format(TOKEN, voice_file.file_path))
+    with open("audio.ogg", "wb") as f:
+        f.write(file.content)
 
-def handle_response(text: str) -> str:
-    processed = text.lower()
+    # Convert voice message to .wav format
+    sound = AudioSegment.from_file("audio.ogg", format="ogg")
+    sound.export("audio.wav", format="wav")
 
-    if "hello" in processed:
-        return "yo sup"
-    if "how are you" in processed:
-        return "take a guess i am bot"
-    if "tell me a joke" in processed:
-        return "knock knock"
+    # Convert voice meassage to text message
+    recognizer = sr.Recognizer()
+    with sr.AudioFile("audio.wav") as source:
+        audio_file = recognizer.record(source)
+        query = recognizer.recognize_google(audio_file)
 
-    return "ask me something i know"
+    # Get response from Mistral bot
+    msg.append(ChatMessage.from_user(query))
+    response = generator.run(messages=msg)
+    msg.append(response["replies"][0])
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=response["replies"][0].content)
 
-
-async def handle_message(update: Update, context: CallbackContext):
-    message_type = update.message.chat.type
-    text = update.message.text
-
-    print(f'User({update.message.from_user.id}) in {message_type}: "{text}"')
-
-    response = handle_response(text)
-    print("bot:", response)
-    await update.message.reply_text(response)
-
-
-async def error(update: Update, context: CallbackContext):
-    print(f'Update {update} caused error {context.error}')
+    os.remove("audio.ogg")
+    os.remove("audio.wav")
+    if len(msg) > 20:
+        msg.pop(0)
+        msg.pop(0)
 
 
-if __name__ == '__main__':
-    app_builder = ApplicationBuilder()
-    app_builder.token(const.token)
+# Add handlers
+app.add_handler(CommandHandler('start', start))
+app.add_handler(CommandHandler('help', help))
+app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+app.add_handler(MessageHandler(filters._Voice, handle_voice))
 
-    app = app_builder.build()
 
-    # Commands
-    app.add_handler(CommandHandler('start', start_command))
-    app.add_handler(CommandHandler('help', help_command))
-    app.add_handler(CommandHandler('custom', custom_command))
-
-    # Messages
-    app.add_handler(MessageHandler(filters.TEXT, handle_message))
-
-    # Errors
-    app.add_error_handler(error)
-
-    # Polls the bot
-    print('Polling.......')
-    app.run_polling(poll_interval=3)
+if __name__ == "__main__":
+    print("Bot is running...")
+    print("Press Ctrl + C to stop bot")
+    app.run_polling()
